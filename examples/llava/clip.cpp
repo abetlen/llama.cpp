@@ -2533,7 +2533,7 @@ bool clip_model_quantize(const char * fname_inp, const char * fname_out, const i
 
 int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
     if (ctx->proj_type == PROJECTOR_TYPE_IDEFICS2) {
-        return ctx->vision_model.mm_pr_latents_w->ne[1];
+        return ctx->vision_model.mm_pr_latents_w->ne[0];
     }
     if (ctx->proj_type == PROJECTOR_TYPE_LDP) {
         return ctx->vision_model.mm_model_block_1_block_2_1_b->ne[0];

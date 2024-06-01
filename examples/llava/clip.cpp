@@ -121,6 +121,7 @@ static std::string format(const char * fmt, ...) {
 #define TN_MVLM_PROJ_MLP   "mm.model.mlp.%d.%s"
 #define TN_MVLM_PROJ_BLOCK "mm.model.mb_block.%d.block.%d.%s"
 #define TN_MVLM_PROJ_PEG   "mm.model.peg.%d.%s"
+#define TN_IDEFICS2_PROJ   "mm.%s.%s"
 #define TN_IMAGE_NEWLINE   "model.image_newline"
 
 
@@ -129,6 +130,7 @@ enum projector_type {
     PROJECTOR_TYPE_MLP_NORM,
     PROJECTOR_TYPE_LDP,
     PROJECTOR_TYPE_LDPV2,
+    PROJECTOR_TYPE_IDEFICS2,
     PROJECTOR_TYPE_UNKNOWN,
 };
 
@@ -136,6 +138,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_MLP, "mlp" },
     { PROJECTOR_TYPE_LDP, "ldp" },
     { PROJECTOR_TYPE_LDPV2, "ldpv2"},
+    { PROJECTOR_TYPE_IDEFICS2, "idefics2"},
 };
 
 
@@ -488,6 +491,46 @@ struct clip_vision_model {
     struct ggml_tensor * mm_model_mlp_2_b;
     struct ggml_tensor * mm_model_peg_0_w;
     struct ggml_tensor * mm_model_peg_0_b;
+
+    // IDEFICS2 projection
+    struct ggml_tensor * mm_mp_down_w;
+    struct ggml_tensor * mm_mp_gate_w;
+    struct ggml_tensor * mm_mp_up_w;
+    struct ggml_tensor * mm_pr_latents_w;
+    struct ggml_tensor * mm_pr_ln0_w;
+
+    struct ggml_tensor * mm_pr_block_0_ln0_w;
+    struct ggml_tensor * mm_pr_block_0_ln1_w;
+    struct ggml_tensor * mm_pr_block_0_ffn_down_w;
+    struct ggml_tensor * mm_pr_block_0_ffn_gate_w;
+    struct ggml_tensor * mm_pr_block_0_ffn_up_w;
+    struct ggml_tensor * mm_pr_block_0_ln2_w;
+    struct ggml_tensor * mm_pr_block_0_attn_k_w;
+    struct ggml_tensor * mm_pr_block_0_attn_q_w;
+    struct ggml_tensor * mm_pr_block_0_attn_v_w;
+    struct ggml_tensor * mm_pr_block_0_attn_o_w;
+
+    struct ggml_tensor * mm_pr_block_1_ln0_w;
+    struct ggml_tensor * mm_pr_block_1_ln1_w;
+    struct ggml_tensor * mm_pr_block_1_ffn_down_w;
+    struct ggml_tensor * mm_pr_block_1_ffn_gate_w;
+    struct ggml_tensor * mm_pr_block_1_ffn_up_w;
+    struct ggml_tensor * mm_pr_block_1_ln2_w;
+    struct ggml_tensor * mm_pr_block_1_attn_k_w;
+    struct ggml_tensor * mm_pr_block_1_attn_q_w;
+    struct ggml_tensor * mm_pr_block_1_attn_v_w;
+    struct ggml_tensor * mm_pr_block_1_attn_o_w;
+
+    struct ggml_tensor * mm_pr_block_2_ln0_w;
+    struct ggml_tensor * mm_pr_block_2_ln1_w;
+    struct ggml_tensor * mm_pr_block_2_ffn_down_w;
+    struct ggml_tensor * mm_pr_block_2_ffn_gate_w;
+    struct ggml_tensor * mm_pr_block_2_ffn_up_w;
+    struct ggml_tensor * mm_pr_block_2_ln2_w;
+    struct ggml_tensor * mm_pr_block_2_attn_k_w;
+    struct ggml_tensor * mm_pr_block_2_attn_q_w;
+    struct ggml_tensor * mm_pr_block_2_attn_v_w;
+    struct ggml_tensor * mm_pr_block_2_attn_o_w;
 };
 
 struct clip_ctx {
@@ -863,6 +906,393 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
             peg_0 = ggml_add(ctx0, peg_0, mlp_2);
             peg_0 = ggml_reshape_3d(ctx0, peg_0, peg_0->ne[0], peg_0->ne[1] * peg_0->ne[2], peg_0->ne[3]);
             embeddings = peg_0;
+        }
+        else if (ctx->proj_type == PROJECTOR_TYPE_IDEFICS2)
+        {
+            // Modality Projection
+            // https://github.com/huggingface/transformers/blob/main/src/transformers/models/idefics2/modeling_idefics2.py#L485
+            // hiden_size = vision_config.hidden_size = 4096
+            // intermediate_size = text_config.intermediate_size (14336 in mistralconfig)
+            // output_size = text_config.hidden_size (4096 in mistralconfig)
+            // hidden_act = text_config.hidden_act (silu in mistralconfig)
+
+            // https://github.com/huggingface/transformers/blob/9d35edbb30625489bf286a9b15aed0c5a3119c1c/src/transformers/models/idefics2/modeling_idefics2.py#L500
+            struct ggml_tensor * mlp = ggml_mul_mat(
+                ctx0,
+                model.mm_mp_down_w,
+                ggml_mul(
+                    ctx0,
+                    ggml_silu(ctx0, ggml_mul_mat(ctx0, model.mm_mp_gate_w, embeddings)),
+                    ggml_mul_mat(ctx0, model.mm_mp_up_w, embeddings)
+                )
+            );
+
+            // Perceiver Resampler
+            // https://github.com/huggingface/transformers/blob/main/src/transformers/models/idefics2/modeling_idefics2.py#L1238
+            // hidden_size = text_config.hidden_size = 4096
+            // hidden_act = perceiver_config.hidden_act = silu
+            // n_latents = perceiver_config.resampler_n_latents = 64
+            // depth = perceiver_config.resampler_depth = 3
+            // rms_norm_eps = text_config.rms_norm_eps = 1e-6
+            float rms_norm_eps = 1e-6;
+
+            // Perceiver Resampler Layer
+            // https://github.com/huggingface/transformers/blob/main/src/transformers/models/idefics2/modeling_idefics2.py#L1166
+            // hidden_size = text_config.hidden_size = 4096
+            // n_latents = perceiver_config.resampler_n_latents = 64
+            // depth = perceiver_config.resampler_depth = 3
+            // rms_norm_eps = text_config.rms_norm_eps = 1e-6
+
+            struct ggml_tensor * latents;
+            struct ggml_tensor * residual;
+            struct ggml_tensor * context;
+
+            latents = model.mm_pr_latents_w; // first layer latents are just the weights, double check
+            context = mlp; // this doesn't seem to be updated, double check
+
+            // perceiver layer 0
+            {
+                context = mlp;
+                residual = latents;
+
+                // input latents_norm
+                {
+                    latents = ggml_rms_norm(ctx0, latents, rms_norm_eps);
+                    latents = ggml_mul(ctx0, latents, model.mm_pr_block_0_ln0_w);
+                }
+
+                // input context norm
+                {
+                    context = ggml_rms_norm(ctx0, context, rms_norm_eps);
+                    context = ggml_mul(ctx0, context, model.mm_pr_block_0_ln1_w);
+                }
+
+                // PerceiverAttention
+                // https://github.com/huggingface/transformers/blob/a564d10afe1a78c31934f0492422700f61a0ffc0/src/transformers/models/idefics2/modeling_idefics2.py#L791
+                // hidden_size = text_config.hidden_size = 4096
+                // num_heads = perceiver_config.resampler_n_heads = 16
+                // head_dim = perceiver_config.resampler_head_dim = 96
+                // num_key_value_heads = perceiver_config.num_key_value_heads = 8
+                // num_key_value_groups = num_heads // num_key_value_heads = 2
+
+                // https://github.com/huggingface/transformers/blob/96eb06286b63c9c93334d507e632c175d6ba8b28/src/transformers/models/idefics2/modeling_idefics2.py#L836
+                // hidden_states = torch.concat([context, latents], dim=-2)
+                struct ggml_tensor * hidden_states = ggml_permute(
+                    ctx0,
+                    ggml_concat(
+                        ctx0,
+                        ggml_permute(ctx0, context, 0, 2, 1, 3),
+                        ggml_permute(ctx0, latents, 0, 2, 1, 3)
+                    ),
+                    0, 2, 1, 3
+                );
+                int32_t q_len = latents->ne[1];
+                int32_t kv_seq_len = q_len + context->ne[1];
+                hidden_states = ggml_cont(ctx0, hidden_states);
+
+                // self-attention
+                {
+                    int32_t hidden_size = 4096;
+                    int32_t num_heads = 16;
+                    int32_t head_dim = 96;
+                    int32_t num_key_value_heads = 4;
+                    int32_t batch_size = 1;
+
+                    int32_t n_latents = 64;
+
+                    int32_t num_key_value_groups = num_heads / num_key_value_heads; // 2
+
+                    // attn_q = [4096, 1536], cur = [4096, 64]
+                    struct ggml_tensor * Q = ggml_mul_mat(ctx0, model.mm_pr_block_0_attn_q_w, latents);
+
+                    // Q shape = [1536, 64, 1, 1]
+                    Q = ggml_scale_inplace(ctx0, Q, 1.0f / sqrt((float)head_dim));
+                    Q = ggml_reshape_4d(ctx0, Q, head_dim, num_heads, q_len, batch_size); // WRONG
+                    Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
+                    Q = ggml_reshape_3d(ctx0, Q, head_dim, q_len, num_heads * batch_size);
+
+                    // attn_k = [4096, 384], cur = [4096, 64]
+                    struct ggml_tensor * K = ggml_mul_mat(ctx0, model.mm_pr_block_0_attn_k_w, hidden_states);
+
+                    K = ggml_reshape_4d(ctx0, K, head_dim, num_key_value_heads, kv_seq_len, batch_size);
+                    K = ggml_cont(ctx0, ggml_permute(ctx0, K, 0, 2, 1, 3));
+                    K = ggml_reshape_3d(ctx0, K, head_dim, kv_seq_len, num_key_value_heads * batch_size);
+
+                    // attn_v = [4096, 384], cur = [4096, 64]
+                    struct ggml_tensor * V = ggml_mul_mat(ctx0, model.mm_pr_block_0_attn_v_w, hidden_states);
+
+                    V = ggml_reshape_4d(ctx0, V, head_dim, num_key_value_heads, kv_seq_len, batch_size);
+                    V = ggml_cont(ctx0, ggml_permute(ctx0, V, 2, 0, 1, 3));
+                    V = ggml_reshape_3d(ctx0, V, kv_seq_len, head_dim, num_key_value_heads * batch_size);
+
+                    struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
+                    KQ = ggml_soft_max_inplace(ctx0, KQ);
+                    struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ);
+
+                    // KQV = [96, 64, 16, 1]
+                    KQV = ggml_reshape_4d(ctx0, KQV, head_dim, q_len, num_heads, batch_size);
+                    KQV = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
+
+                    latents = ggml_cont_3d(ctx0, KQV, head_dim * num_heads, q_len, batch_size);
+
+                    // attention output
+                    latents = ggml_mul_mat(ctx0, model.mm_pr_block_0_attn_o_w, latents);
+                }
+
+                // add residual
+                latents = ggml_add(ctx0, residual, latents);
+                residual = latents;
+
+                // layernorm1
+                {
+                    latents = ggml_rms_norm(ctx0, latents, rms_norm_eps);
+                    latents = ggml_mul(ctx0, latents, model.mm_pr_block_0_ln2_w);
+                }
+
+                // mlp
+                latents = ggml_mul_mat(
+                    ctx0,
+                    model.mm_pr_block_0_ffn_down_w,
+                    ggml_mul(
+                        ctx0,
+                        ggml_silu(ctx0, ggml_mul_mat(ctx0, model.mm_pr_block_0_ffn_gate_w, latents)),
+                        ggml_mul_mat(ctx0, model.mm_pr_block_0_ffn_up_w, latents)));
+
+                // add residual
+                latents = ggml_add(ctx0, residual, latents);
+            }
+
+            // perceiver layer 1
+            {
+                context = mlp;
+                residual = latents;
+
+                // input latents_norm
+                {
+                    latents = ggml_rms_norm(ctx0, latents, rms_norm_eps);
+                    latents = ggml_mul(ctx0, latents, model.mm_pr_block_1_ln0_w);
+                }
+
+                // input context norm
+                {
+                    context = ggml_rms_norm(ctx0, context, rms_norm_eps);
+                    context = ggml_mul(ctx0, context, model.mm_pr_block_1_ln1_w);
+                }
+
+                // PerceiverAttention
+                // https://github.com/huggingface/transformers/blob/a564d10afe1a78c31934f0492422700f61a0ffc0/src/transformers/models/idefics2/modeling_idefics2.py#L791
+                // hidden_size = text_config.hidden_size = 4096
+                // num_heads = perceiver_config.resampler_n_heads = 16
+                // head_dim = perceiver_config.resampler_head_dim = 96
+                // num_key_value_heads = perceiver_config.num_key_value_heads = 8
+                // num_key_value_groups = num_heads // num_key_value_heads = 2
+
+                // https://github.com/huggingface/transformers/blob/96eb06286b63c9c93334d507e632c175d6ba8b28/src/transformers/models/idefics2/modeling_idefics2.py#L836
+                // hidden_states = torch.concat([context, latents], dim=-2)
+                struct ggml_tensor * hidden_states = ggml_permute(
+                    ctx0,
+                    ggml_concat(
+                        ctx0,
+                        ggml_permute(ctx0, context, 0, 2, 1, 3),
+                        ggml_permute(ctx0, latents, 0, 2, 1, 3)
+                    ),
+                    0, 2, 1, 3
+                );
+                int32_t q_len = latents->ne[1];
+                int32_t kv_seq_len = q_len + context->ne[1];
+                hidden_states = ggml_cont(ctx0, hidden_states);
+
+                // self-attention
+                {
+                    int32_t hidden_size = 4096;
+                    int32_t num_heads = 16;
+                    int32_t head_dim = 96;
+                    int32_t num_key_value_heads = 4;
+                    int32_t batch_size = 1;
+
+                    int32_t n_latents = 64;
+
+                    int32_t num_key_value_groups = num_heads / num_key_value_heads; // 2
+
+                    // attn_q = [4096, 1536], cur = [4096, 64]
+                    struct ggml_tensor * Q = ggml_mul_mat(ctx0, model.mm_pr_block_1_attn_q_w, latents);
+
+                    // Q shape = [1536, 64, 1, 1]
+                    Q = ggml_scale_inplace(ctx0, Q, 1.0f / sqrt((float)head_dim));
+                    Q = ggml_reshape_4d(ctx0, Q, head_dim, num_heads, q_len, batch_size); // WRONG
+                    Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
+                    Q = ggml_reshape_3d(ctx0, Q, head_dim, q_len, num_heads * batch_size);
+
+                    // attn_k = [4096, 384], cur = [4096, 64]
+                    struct ggml_tensor * K = ggml_mul_mat(ctx0, model.mm_pr_block_1_attn_k_w, hidden_states);
+
+                    K = ggml_reshape_4d(ctx0, K, head_dim, num_key_value_heads, kv_seq_len, batch_size);
+                    K = ggml_cont(ctx0, ggml_permute(ctx0, K, 0, 2, 1, 3));
+                    K = ggml_reshape_3d(ctx0, K, head_dim, kv_seq_len, num_key_value_heads * batch_size);
+
+                    // attn_v = [4096, 384], cur = [4096, 64]
+                    struct ggml_tensor * V = ggml_mul_mat(ctx0, model.mm_pr_block_1_attn_v_w, hidden_states);
+
+                    V = ggml_reshape_4d(ctx0, V, head_dim, num_key_value_heads, kv_seq_len, batch_size);
+                    V = ggml_cont(ctx0, ggml_permute(ctx0, V, 2, 0, 1, 3));
+                    V = ggml_reshape_3d(ctx0, V, kv_seq_len, head_dim, num_key_value_heads * batch_size);
+
+                    struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
+                    KQ = ggml_soft_max_inplace(ctx0, KQ);
+                    struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ);
+
+                    // KQV = [96, 64, 16, 1]
+                    KQV = ggml_reshape_4d(ctx0, KQV, head_dim, q_len, num_heads, batch_size);
+                    KQV = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
+
+                    latents = ggml_cont_3d(ctx0, KQV, head_dim * num_heads, q_len, batch_size);
+
+                    // attention output
+                    latents = ggml_mul_mat(ctx0, model.mm_pr_block_1_attn_o_w, latents);
+                }
+
+                // add residual
+                latents = ggml_add(ctx0, residual, latents);
+                residual = latents;
+
+                // layernorm1
+                {
+                    latents = ggml_rms_norm(ctx0, latents, rms_norm_eps);
+                    latents = ggml_mul(ctx0, latents, model.mm_pr_block_1_ln2_w);
+                }
+
+                // mlp
+                latents = ggml_mul_mat(
+                    ctx0,
+                    model.mm_pr_block_1_ffn_down_w,
+                    ggml_mul(
+                        ctx0,
+                        ggml_silu(ctx0, ggml_mul_mat(ctx0, model.mm_pr_block_1_ffn_gate_w, latents)),
+                        ggml_mul_mat(ctx0, model.mm_pr_block_1_ffn_up_w, latents)));
+
+                // add residual
+                latents = ggml_add(ctx0, residual, latents);
+            }
+
+            // perceiver layer 2
+            {
+                context = mlp;
+                residual = latents;
+
+                // input latents_norm
+                {
+                    latents = ggml_rms_norm(ctx0, latents, rms_norm_eps);
+                    latents = ggml_mul(ctx0, latents, model.mm_pr_block_2_ln0_w);
+                }
+
+                // input context norm
+                {
+                    context = ggml_rms_norm(ctx0, context, rms_norm_eps);
+                    context = ggml_mul(ctx0, context, model.mm_pr_block_2_ln1_w);
+                }
+
+                // PerceiverAttention
+                // https://github.com/huggingface/transformers/blob/a564d10afe1a78c31934f0492422700f61a0ffc0/src/transformers/models/idefics2/modeling_idefics2.py#L791
+                // hidden_size = text_config.hidden_size = 4096
+                // num_heads = perceiver_config.resampler_n_heads = 16
+                // head_dim = perceiver_config.resampler_head_dim = 96
+                // num_key_value_heads = perceiver_config.num_key_value_heads = 8
+                // num_key_value_groups = num_heads // num_key_value_heads = 2
+
+                // https://github.com/huggingface/transformers/blob/96eb06286b63c9c93334d507e632c175d6ba8b28/src/transformers/models/idefics2/modeling_idefics2.py#L836
+                // hidden_states = torch.concat([context, latents], dim=-2)
+                struct ggml_tensor * hidden_states = ggml_permute(
+                    ctx0,
+                    ggml_concat(
+                        ctx0,
+                        ggml_permute(ctx0, context, 0, 2, 1, 3),
+                        ggml_permute(ctx0, latents, 0, 2, 1, 3)
+                    ),
+                    0, 2, 1, 3
+                );
+                int32_t q_len = latents->ne[1];
+                int32_t kv_seq_len = q_len + context->ne[1];
+                hidden_states = ggml_cont(ctx0, hidden_states);
+
+                // self-attention
+                {
+                    int32_t hidden_size = 4096;
+                    int32_t num_heads = 16;
+                    int32_t head_dim = 96;
+                    int32_t num_key_value_heads = 4;
+                    int32_t batch_size = 1;
+
+                    int32_t n_latents = 64;
+
+                    int32_t num_key_value_groups = num_heads / num_key_value_heads; // 2
+
+                    // attn_q = [4096, 1536], cur = [4096, 64]
+                    struct ggml_tensor * Q = ggml_mul_mat(ctx0, model.mm_pr_block_2_attn_q_w, latents);
+
+                    // Q shape = [1536, 64, 1, 1]
+                    Q = ggml_scale_inplace(ctx0, Q, 1.0f / sqrt((float)head_dim));
+                    Q = ggml_reshape_4d(ctx0, Q, head_dim, num_heads, q_len, batch_size); // WRONG
+                    Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
+                    Q = ggml_reshape_3d(ctx0, Q, head_dim, q_len, num_heads * batch_size);
+
+                    // attn_k = [4096, 384], cur = [4096, 64]
+                    struct ggml_tensor * K = ggml_mul_mat(ctx0, model.mm_pr_block_2_attn_k_w, hidden_states);
+
+                    K = ggml_reshape_4d(ctx0, K, head_dim, num_key_value_heads, kv_seq_len, batch_size);
+                    K = ggml_cont(ctx0, ggml_permute(ctx0, K, 0, 2, 1, 3));
+                    K = ggml_reshape_3d(ctx0, K, head_dim, kv_seq_len, num_key_value_heads * batch_size);
+
+                    // attn_v = [4096, 384], cur = [4096, 64]
+                    struct ggml_tensor * V = ggml_mul_mat(ctx0, model.mm_pr_block_2_attn_v_w, hidden_states);
+
+                    V = ggml_reshape_4d(ctx0, V, head_dim, num_key_value_heads, kv_seq_len, batch_size);
+                    V = ggml_cont(ctx0, ggml_permute(ctx0, V, 2, 0, 1, 3));
+                    V = ggml_reshape_3d(ctx0, V, kv_seq_len, head_dim, num_key_value_heads * batch_size);
+
+                    struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
+                    KQ = ggml_soft_max_inplace(ctx0, KQ);
+                    struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ);
+
+                    // KQV = [96, 64, 16, 1]
+                    KQV = ggml_reshape_4d(ctx0, KQV, head_dim, q_len, num_heads, batch_size);
+                    KQV = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
+
+                    latents = ggml_cont_3d(ctx0, KQV, head_dim * num_heads, q_len, batch_size);
+
+                    // attention output
+                    latents = ggml_mul_mat(ctx0, model.mm_pr_block_2_attn_o_w, latents);
+                }
+
+                // add residual
+                latents = ggml_add(ctx0, residual, latents);
+                residual = latents;
+
+                // layernorm1
+                {
+                    latents = ggml_rms_norm(ctx0, latents, rms_norm_eps);
+                    latents = ggml_mul(ctx0, latents, model.mm_pr_block_2_ln2_w);
+                }
+
+                // mlp
+                latents = ggml_mul_mat(
+                    ctx0,
+                    model.mm_pr_block_2_ffn_down_w,
+                    ggml_mul(
+                        ctx0,
+                        ggml_silu(ctx0, ggml_mul_mat(ctx0, model.mm_pr_block_2_ffn_gate_w, latents)),
+                        ggml_mul_mat(ctx0, model.mm_pr_block_2_ffn_up_w, latents)));
+
+                // add residual
+                latents = ggml_add(ctx0, residual, latents);
+            }
+
+            // layer norm
+            {
+                latents = ggml_rms_norm(ctx0, latents, eps);
+                latents = ggml_mul(ctx0, latents, model.mm_pr_ln0_w);
+            }
+
+            embeddings = latents;
         }
         else {
             GGML_ASSERT(false);
@@ -1271,6 +1701,48 @@ struct clip_ctx * clip_model_load(const char * fname, const int verbosity = 1) {
             vision_model.mm_model_mlp_2_b = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_MLP, 2, "bias"));
             vision_model.mm_model_peg_0_w = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_PEG, 0, "weight"));
             vision_model.mm_model_peg_0_b = get_tensor(new_clip->ctx_data, format(TN_MVLM_PROJ_PEG, 0, "bias"));
+        }
+        else if (new_clip->proj_type == PROJECTOR_TYPE_IDEFICS2)
+        {
+            vision_model.mm_mp_down_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "mp.ffn_down", "weight"));
+            vision_model.mm_mp_gate_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "mp.ffn_gate", "weight"));
+            vision_model.mm_mp_up_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "mp.ffn_up", "weight"));
+
+            vision_model.mm_pr_latents_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.latents", "weight"));
+            vision_model.mm_pr_ln0_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.ln0", "weight"));
+
+            vision_model.mm_pr_block_0_ln0_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.0.ln0", "weight"));
+            vision_model.mm_pr_block_0_ln1_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.0.ln1", "weight"));
+            vision_model.mm_pr_block_0_ffn_down_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.0.ffn_down", "weight"));
+            vision_model.mm_pr_block_0_ffn_gate_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.0.ffn_gate", "weight"));
+            vision_model.mm_pr_block_0_ffn_up_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.0.ffn_up", "weight"));
+            vision_model.mm_pr_block_0_ln2_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.0.ln2", "weight"));
+            vision_model.mm_pr_block_0_attn_k_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.0.attn_k", "weight"));
+            vision_model.mm_pr_block_0_attn_q_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.0.attn_q", "weight"));
+            vision_model.mm_pr_block_0_attn_v_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.0.attn_v", "weight"));
+            vision_model.mm_pr_block_0_attn_o_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.0.attn_o", "weight"));
+
+            vision_model.mm_pr_block_1_ln0_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.1.ln0", "weight"));
+            vision_model.mm_pr_block_1_ln1_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.1.ln1", "weight"));
+            vision_model.mm_pr_block_1_ffn_down_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.1.ffn_down", "weight"));
+            vision_model.mm_pr_block_1_ffn_gate_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.1.ffn_gate", "weight"));
+            vision_model.mm_pr_block_1_ffn_up_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.1.ffn_up", "weight"));
+            vision_model.mm_pr_block_1_ln2_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.1.ln2", "weight"));
+            vision_model.mm_pr_block_1_attn_k_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.1.attn_k", "weight"));
+            vision_model.mm_pr_block_1_attn_q_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.1.attn_q", "weight"));
+            vision_model.mm_pr_block_1_attn_v_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.1.attn_v", "weight"));
+            vision_model.mm_pr_block_1_attn_o_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.1.attn_o", "weight"));
+
+            vision_model.mm_pr_block_2_ln0_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.2.ln0", "weight"));
+            vision_model.mm_pr_block_2_ln1_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.2.ln1", "weight"));
+            vision_model.mm_pr_block_2_ffn_down_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.2.ffn_down", "weight"));
+            vision_model.mm_pr_block_2_ffn_gate_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.2.ffn_gate", "weight"));
+            vision_model.mm_pr_block_2_ffn_up_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.2.ffn_up", "weight"));
+            vision_model.mm_pr_block_2_ln2_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.2.ln2", "weight"));
+            vision_model.mm_pr_block_2_attn_k_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.2.attn_k", "weight"));
+            vision_model.mm_pr_block_2_attn_q_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.2.attn_q", "weight"));
+            vision_model.mm_pr_block_2_attn_v_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.2.attn_v", "weight"));
+            vision_model.mm_pr_block_2_attn_o_w = get_tensor(new_clip->ctx_data, format(TN_IDEFICS2_PROJ, "pr.blk.2.attn_o", "weight"));
         }
         else {
             std::string proj_type = PROJECTOR_TYPE_NAMES[new_clip->proj_type];
@@ -2060,6 +2532,9 @@ bool clip_model_quantize(const char * fname_inp, const char * fname_out, const i
 }
 
 int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
+    if (ctx->proj_type == PROJECTOR_TYPE_IDEFICS2) {
+        return ctx->vision_model.mm_pr_latents_w->ne[1];
+    }
     if (ctx->proj_type == PROJECTOR_TYPE_LDP) {
         return ctx->vision_model.mm_model_block_1_block_2_1_b->ne[0];
     }

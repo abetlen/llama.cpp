@@ -982,7 +982,8 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
                     ggml_concat(
                         ctx0,
                         ggml_permute(ctx0, context, 0, 2, 1, 3),
-                        ggml_permute(ctx0, latents, 0, 2, 1, 3)
+                        ggml_permute(ctx0, latents, 0, 2, 1, 3),
+                        2
                     ),
                     0, 2, 1, 3
                 );
@@ -1094,7 +1095,8 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
                     ggml_concat(
                         ctx0,
                         ggml_permute(ctx0, context, 0, 2, 1, 3),
-                        ggml_permute(ctx0, latents, 0, 2, 1, 3)
+                        ggml_permute(ctx0, latents, 0, 2, 1, 3),
+                        2
                     ),
                     0, 2, 1, 3
                 );
@@ -1206,7 +1208,8 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
                     ggml_concat(
                         ctx0,
                         ggml_permute(ctx0, context, 0, 2, 1, 3),
-                        ggml_permute(ctx0, latents, 0, 2, 1, 3)
+                        ggml_permute(ctx0, latents, 0, 2, 1, 3),
+                        2
                     ),
                     0, 2, 1, 3
                 );

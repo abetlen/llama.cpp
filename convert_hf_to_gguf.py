@@ -63,6 +63,7 @@ class Model:
     model_name: str | None
     metadata_override: Path | None
     dir_model_card: Path
+    ignore_unknown_tensors: bool = False
 
     # subclasses should define this!
     model_arch: gguf.MODEL_ARCH
@@ -70,7 +71,7 @@ class Model:
     def __init__(self, dir_model: Path, ftype: gguf.LlamaFileType, fname_out: Path, is_big_endian: bool = False,
                  use_temp_file: bool = False, eager: bool = False,
                  metadata_override: Path | None = None, model_name: str | None = None,
-                 split_max_tensors: int = 0, split_max_size: int = 0, dry_run: bool = False, small_first_shard: bool = False):
+                 split_max_tensors: int = 0, split_max_size: int = 0, dry_run: bool = False, small_first_shard: bool = False, ignore_unkown_tensors: bool = False):
         if type(self) is Model:
             raise TypeError(f"{type(self).__name__!r} should not be directly instantiated")
 
@@ -92,6 +93,7 @@ class Model:
         self.metadata_override = metadata_override
         self.model_name = model_name
         self.dir_model_card = dir_model  # overridden in convert_lora_to_gguf.py
+        self.ignore_unknown_tensors = ignore_unkown_tensors
 
         # Apply heuristics to figure out typical tensor encoding based on first layer tensor encoding type
         if self.ftype == gguf.LlamaFileType.GUESSED:
@@ -249,7 +251,12 @@ class Model:
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         del bid  # unused
 
-        return [(self.map_tensor_name(name), data_torch)]
+        try:
+            return [(self.map_tensor_name(name), data_torch)]
+        except ValueError as e:
+            if not self.ignore_unknown_tensors:
+                raise e
+            return []
 
     def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
         del name, new_name, bid, n_dims  # unused
@@ -3971,6 +3978,14 @@ def parse_args() -> argparse.Namespace:
         "--metadata", type=Path,
         help="Specify the path for an authorship metadata override file"
     )
+    parser.add_argument(
+        "--ignore-unknown-tensors", action="store_true",
+        help="Ignore tensors that are not recognized by the converter"
+    )
+    parser.add_argument(
+        "--model-arch", type=str, default=None,
+        help="Override the model architecture"
+    )
 
     return parser.parse_args()
 
@@ -4031,7 +4046,7 @@ def main() -> None:
 
     with torch.inference_mode():
         output_type = ftype_map[args.outtype]
-        model_architecture = hparams["architectures"][0]
+        model_architecture = args.model_arch if args.model_arch is not None else hparams["architectures"][0]
 
         try:
             model_class = Model.from_model_architecture(model_architecture)
@@ -4045,7 +4060,7 @@ def main() -> None:
                                      metadata_override=args.metadata, model_name=args.model_name,
                                      split_max_tensors=args.split_max_tensors,
                                      split_max_size=split_str_to_n_bytes(args.split_max_size), dry_run=args.dry_run,
-                                     small_first_shard=args.no_tensor_first_split)
+                                     small_first_shard=args.no_tensor_first_split, ignore_unkown_tensors=args.ignore_unknown_tensors)
 
         if args.vocab_only:
             logger.info("Exporting model vocab...")
